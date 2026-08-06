@@ -13,10 +13,16 @@ organization rather than inferred from documentation:
    ``agent-metadata`` carries provenance only (botDefinitionId, platform,
    status). This is why ``asset_types`` defaults to the protocol-typed assets.
 
-2. The host does not survive the catalog hop. ``transport`` gives a path
-   (``{"kind": "streamableHttp", "path": "/mcp"}``) and never a base URL, and
-   the asset record's own fields carry no endpoint. So an imported asset is
-   discovery-only unless an operator supplies ``base_url_override``.
+2. The endpoint lives in ``attributes``, not in the transport descriptor.
+   ``mcp-metadata.transport`` gives a path only
+   (``{"kind": "streamableHttp", "path": "/mcp"}``), but the asset record's
+   ``attributes`` list can carry a ``url`` key holding a COMPLETE endpoint -
+   e.g. ``https://mapstools.googleapis.com/mcp``. Whether it does depends on
+   whether the scanner that imported the asset knew the deployed endpoint: in
+   the sample org, 2 of 3 ``mcp`` assets had one and no ``a2a`` asset did. So
+   connectability is per-asset, not a property of Exchange. Assets without a
+   ``url`` attribute are discovery-only unless an operator supplies
+   ``base_url_override``.
 
 API documentation: https://docs.mulesoft.com/exchange/
 The asset listing endpoint (Platform API v2) is undocumented but stable in
@@ -143,23 +149,73 @@ def _extract_transport(mcp_metadata: dict[str, Any]) -> tuple[str, str | None]:
     return transport_type, path if isinstance(path, str) else None
 
 
+def _extract_attribute_url(asset: dict[str, Any]) -> str | None:
+    """Read an absolute endpoint from the asset's ``attributes`` list.
+
+    ``attributes`` is a list of ``{"key": ..., "value": ...}`` pairs. Assets
+    imported by a scanner that knew the deployed endpoint carry a ``url``
+    attribute holding a COMPLETE url, host included - e.g.
+    ``https://mapstools.googleapis.com/mcp``. This is the authoritative
+    endpoint when present, and it is more specific than anything derivable
+    from ``mcp-metadata.transport`` (which holds a path only).
+
+    Args:
+        asset: Raw Exchange asset dict
+
+    Returns:
+        Absolute http(s) url, or None when the attribute is absent
+    """
+    attributes = asset.get("attributes")
+    if not isinstance(attributes, list):
+        return None
+
+    for entry in attributes:
+        if not isinstance(entry, dict) or entry.get("key") != "url":
+            continue
+
+        value = entry.get("value")
+        if not isinstance(value, str):
+            continue
+
+        value = value.strip()
+        # Only absolute http(s) urls are usable as a proxy target. A relative
+        # value would silently become a bad route, so reject rather than guess.
+        if value.startswith(("http://", "https://")):
+            return value
+
+    return None
+
+
 def _resolve_proxy_url(
+    asset: dict[str, Any],
     path: str | None,
     base_url_override: str | None,
 ) -> str | None:
-    """Combine an operator-supplied base URL with the asset's transport path.
+    """Determine the endpoint for an imported asset.
 
-    Exchange never supplies a host, so without an override there is no
-    endpoint and the asset is discovery-only. Returning None is the honest
-    outcome; it must not be papered over with a guessed host.
+    Resolution order, most to least authoritative:
+
+    1. The asset's own ``url`` attribute, when present. This is a complete
+       url recorded by whichever scanner imported the asset into Exchange.
+    2. An operator-supplied ``base_url_override`` joined with the transport
+       path from ``mcp-metadata``.
+    3. The override alone, when the metadata carries no path.
+
+    Returns None when none of those apply - the asset is then discovery-only.
+    That outcome must not be papered over with a guessed host.
 
     Args:
+        asset: Raw Exchange asset dict
         path: Transport path from mcp-metadata, if any
         base_url_override: Operator-supplied base URL for this organization
 
     Returns:
         Absolute URL, or None when no host is available
     """
+    attribute_url = _extract_attribute_url(asset)
+    if attribute_url:
+        return attribute_url
+
     if not base_url_override:
         return None
 
@@ -420,7 +476,7 @@ class AnypointFederationClient(BaseFederationClient):
 
         metadata = self.fetch_asset_metadata(asset, MCP_METADATA_CLASSIFIER, org)
         transport_type, path = _extract_transport(metadata)
-        proxy_url = _resolve_proxy_url(path, org.base_url_override)
+        proxy_url = _resolve_proxy_url(asset, path, org.base_url_override)
 
         tools = metadata.get("tools")
         tool_list = tools if isinstance(tools, list) else []
@@ -494,13 +550,16 @@ class AnypointFederationClient(BaseFederationClient):
 
         path_segment = _sanitize_path_segment(asset_id)
 
+        # Agent-shaped assets carry no transport metadata, but they can still
+        # carry a `url` attribute if the importing scanner knew the endpoint.
+        # None observed in the sample org, so this is usually empty.
+        agent_url = _extract_attribute_url(asset) or org.base_url_override or ""
+
         return {
             "source": ANYPOINT_SOURCE,
             "name": name,
             "description": asset.get("description") or f"Anypoint Exchange agent: {name}",
-            # Exchange holds no endpoint for agent-shaped assets. An override is
-            # the only way this becomes non-empty.
-            "url": org.base_url_override or "",
+            "url": agent_url,
             "path": f"/agents/anypoint-{path_segment}",
             "version": version,
             "supported_protocol": "a2a" if asset.get("type") == "a2a" else "other",
@@ -522,7 +581,7 @@ class AnypointFederationClient(BaseFederationClient):
                 "anypoint_org_id": org.org_id,
                 "asset_type": asset.get("type"),
                 "provenance": provenance,
-                "discovery_only": not org.base_url_override,
+                "discovery_only": not agent_url,
             },
             "cached_at": datetime.now(UTC).isoformat(),
         }

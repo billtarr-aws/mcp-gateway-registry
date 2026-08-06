@@ -1,9 +1,14 @@
 """Tests for the Anypoint Exchange federation client.
 
 Payload shapes in these fixtures were captured from a live Anypoint
-organization, not invented: an ``mcp`` asset's ``mcp-metadata`` carries tools
-with JSON Schemas plus a transport with a path and no host, while ``a2a`` and
-``agent`` assets carry provenance only.
+organization, not invented:
+
+- An ``mcp`` asset's ``mcp-metadata`` carries tools with JSON Schemas plus a
+  transport holding a path and no host.
+- The complete endpoint, when one exists, lives in the asset's ``attributes``
+  list under the ``url`` key - not in the transport descriptor. 2 of 3 ``mcp``
+  assets in the sample org had one; no ``a2a`` asset did.
+- ``a2a`` and ``agent`` assets carry provenance only.
 """
 
 import json
@@ -17,6 +22,7 @@ from registry.schemas.federation_schema import (
 )
 from registry.services.federation.anypoint_client import (
     AnypointFederationClient,
+    _extract_attribute_url,
     _extract_transport,
     _resolve_proxy_url,
     _safe_parse_json,
@@ -68,6 +74,17 @@ MCP_ASSET = {
             "packaging": "json",
             "externalLink": "https://exchange2-asset-manager.s3.amazonaws.com/mcp-metadata.json",
         }
+    ],
+}
+
+MCP_ASSET_WITH_URL = {
+    **MCP_ASSET,
+    "assetId": "google-maps-mcp",
+    "name": "Google Maps MCP",
+    # Captured live: 2 of 3 mcp assets in the sample org carry this.
+    "attributes": [
+        {"key": "platform", "value": "Google"},
+        {"key": "url", "value": "https://mapstools.googleapis.com/mcp"},
     ],
 }
 
@@ -156,21 +173,75 @@ class TestHelpers:
         assert path is None
 
 
+class TestExtractAttributeUrl:
+    """The endpoint lives in attributes[], not in the transport descriptor."""
+
+    def test_reads_absolute_url(self):
+        """Captured live: google-maps-mcp carries a complete endpoint."""
+        asset = {
+            "attributes": [
+                {"key": "platform", "value": "Google"},
+                {"key": "url", "value": "https://mapstools.googleapis.com/mcp"},
+            ]
+        }
+        assert _extract_attribute_url(asset) == "https://mapstools.googleapis.com/mcp"
+
+    def test_absent_url_key_returns_none(self):
+        """Captured live: omni-gateway-orders-mcp-spec has platform only."""
+        asset = {"attributes": [{"key": "platform", "value": "mulesoft"}]}
+        assert _extract_attribute_url(asset) is None
+
+    def test_no_attributes_returns_none(self):
+        assert _extract_attribute_url({"assetId": "x"}) is None
+
+    @pytest.mark.parametrize(
+        "attributes",
+        ["not-a-list", None, [{"key": "url"}], [{"key": "url", "value": 42}], ["garbage"]],
+        ids=["string", "none", "no-value", "non-string-value", "non-dict-entry"],
+    )
+    def test_malformed_attributes_return_none(self, attributes):
+        """A malformed attributes list must not raise."""
+        assert _extract_attribute_url({"attributes": attributes}) is None
+
+    @pytest.mark.parametrize(
+        "value",
+        ["/mcp", "mapstools.googleapis.com/mcp", "ftp://host/mcp", "  ", "javascript:alert(1)"],
+        ids=["relative", "schemeless", "wrong-scheme", "blank", "javascript"],
+    )
+    def test_rejects_non_http_urls(self, value):
+        """A relative or non-http value would become a bad proxy target."""
+        asset = {"attributes": [{"key": "url", "value": value}]}
+        assert _extract_attribute_url(asset) is None
+
+
 class TestResolveProxyUrl:
-    """The host does not survive the catalog hop; this is where that shows up."""
+    """Endpoint resolution: attribute url, then override + path, else none."""
 
-    def test_returns_none_without_override(self):
-        """Exchange supplies a path but no host, so there is no endpoint."""
-        assert _resolve_proxy_url("/mcp", None) is None
+    def test_attribute_url_wins_over_override(self):
+        """The asset's own endpoint is more authoritative than an org default."""
+        asset = {"attributes": [{"key": "url", "value": "https://real.example.com/mcp"}]}
+        assert (
+            _resolve_proxy_url(asset, "/mcp", "https://override.example.com")
+            == "https://real.example.com/mcp"
+        )
 
-    def test_joins_override_and_path(self):
-        assert _resolve_proxy_url("/mcp", "https://gw.example.com") == "https://gw.example.com/mcp"
+    def test_returns_none_without_url_or_override(self):
+        """No attribute url and no override means discovery-only."""
+        assert _resolve_proxy_url({}, "/mcp", None) is None
+
+    def test_falls_back_to_override_and_path(self):
+        assert (
+            _resolve_proxy_url({}, "/mcp", "https://gw.example.com") == "https://gw.example.com/mcp"
+        )
 
     def test_tolerates_duplicate_slashes(self):
-        assert _resolve_proxy_url("/mcp", "https://gw.example.com/") == "https://gw.example.com/mcp"
+        assert (
+            _resolve_proxy_url({}, "/mcp", "https://gw.example.com/")
+            == "https://gw.example.com/mcp"
+        )
 
     def test_override_alone_when_no_path(self):
-        assert _resolve_proxy_url(None, "https://gw.example.com") == "https://gw.example.com"
+        assert _resolve_proxy_url({}, None, "https://gw.example.com") == "https://gw.example.com"
 
 
 class TestAccessToken:
@@ -348,13 +419,21 @@ class TestTransformMcpAsset:
         assert result["transport_type"] == "streamable-http"
         assert result["metadata"]["protocol_version"] == "2025-03-26"
 
-    def test_discovery_only_without_override(self, client):
-        """No host in Exchange means no proxy_pass_url, flagged explicitly."""
+    def test_discovery_only_when_no_attribute_url_or_override(self, client):
+        """An asset with no url attribute and no override cannot be called."""
         with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
             result = client.transform_mcp_asset(MCP_ASSET, _org())
 
         assert result["proxy_pass_url"] is None
         assert result["metadata"]["discovery_only"] is True
+
+    def test_connectable_from_attribute_url_alone(self, client):
+        """An asset carrying a url attribute needs no operator configuration."""
+        with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
+            result = client.transform_mcp_asset(MCP_ASSET_WITH_URL, _org())
+
+        assert result["proxy_pass_url"] == "https://mapstools.googleapis.com/mcp"
+        assert result["metadata"]["discovery_only"] is False
 
     def test_connectable_with_override(self, client):
         with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
