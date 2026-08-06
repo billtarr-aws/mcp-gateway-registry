@@ -5,7 +5,7 @@ Provides endpoints to manage federation configurations.
 """
 
 import logging
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import uuid4
 
@@ -28,6 +28,16 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Anypoint Exchange only exposes published assets for import. This mirrors the
+# AgentCore sync_status_filter="APPROVED" gate: the source registry decides what
+# is publishable, and we honour that decision rather than importing drafts.
+PUBLISHED_ASSET_STATUS: str = "published"
+
+# Provider URL recorded on imported Anypoint agents. The A2A spec requires both
+# organization and url when provider is present, and Exchange supplies no
+# per-asset provider URL, so this identifies the catalog rather than the agent.
+ANYPOINT_PROVIDER_URL: str = "https://anypoint.mulesoft.com"
 
 
 def _check_federation_management_scope(
@@ -74,11 +84,16 @@ router = APIRouter()
 def _validate_federation_endpoints(config: FederationConfig) -> None:
     """Reject federation configs whose endpoints fail SSRF safety checks.
 
-    The anthropic/asor endpoints are fetched server-side during sync, so an
-    attacker-controlled value (e.g. http://169.254.169.254/) would be an SSRF
+    The anthropic/asor/anypoint endpoints are fetched server-side during sync, so
+    an attacker-controlled value (e.g. http://169.254.169.254/) would be an SSRF
     vector. Validate any non-empty endpoint at write time, reusing the shared
     ``_is_safe_url`` allowlist (http/https scheme, no private/loopback/link-local
     or cloud-metadata IPs). Defense-in-depth: sync re-validates before egress.
+
+    Note the attribute name differs per source (``endpoint`` vs ``base_url``), so
+    each entry names its own field rather than assuming one convention. Anypoint's
+    per-organization ``base_url_override`` is validated too: it is operator-supplied
+    and becomes an imported server's ``proxy_pass_url``.
 
     Args:
         config: The federation config being saved.
@@ -88,8 +103,18 @@ def _validate_federation_endpoints(config: FederationConfig) -> None:
     """
     from ..services.skill_service import _is_safe_url
 
-    for label, section in (("anthropic", config.anthropic), ("asor", config.asor)):
-        endpoint = getattr(section, "endpoint", "") or ""
+    candidates: list[tuple[str, str]] = [
+        ("anthropic", getattr(config.anthropic, "endpoint", "") or ""),
+        ("asor", getattr(config.asor, "endpoint", "") or ""),
+        ("anypoint", getattr(config.anypoint, "base_url", "") or ""),
+    ]
+
+    for org in getattr(config.anypoint, "organizations", []) or []:
+        override = getattr(org, "base_url_override", "") or ""
+        if override:
+            candidates.append((f"anypoint organization '{org.org_id}' base_url_override", override))
+
+    for label, endpoint in candidates:
         if endpoint and not _is_safe_url(endpoint):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -977,6 +1002,150 @@ async def _deregister_skills_from_registry(
     return deregistered
 
 
+async def _register_anypoint_server(
+    server_data: dict[str, Any],
+    registered_by: str,
+) -> str | None:
+    """Register one Anypoint MCP asset as a server.
+
+    Args:
+        server_data: Transformed server data from the Anypoint client
+        registered_by: Username recorded as the registrant
+
+    Returns:
+        The server name on success, None on failure or if already present
+    """
+    from ..services.server_service import server_service
+
+    path = server_data["path"]
+
+    existing = await server_service.get_server_info(path)
+    if existing is not None:
+        logger.debug(f"Anypoint server already registered at {path}; skipping")
+        return None
+
+    payload = dict(server_data)
+    payload["registered_by"] = registered_by
+    await server_service.register_server(payload)
+
+    logger.info(f"Synced Anypoint MCP server: {server_data['server_name']} at {path}")
+    return server_data["server_name"]
+
+
+async def _register_anypoint_agent(
+    agent_data: dict[str, Any],
+    registered_by: str,
+) -> str | None:
+    """Register one Anypoint a2a/agent asset as an agent.
+
+    Args:
+        agent_data: Transformed agent data from the Anypoint client
+        registered_by: Username recorded as the registrant
+
+    Returns:
+        The agent name on success, None on failure or if already present
+    """
+    from ..schemas.agent_models import AgentCard, AgentProvider
+    from ..services.agent_service import agent_service
+
+    path = agent_data["path"]
+
+    if await agent_service.get_agent_info(path) is not None:
+        logger.debug(f"Anypoint agent already registered at {path}; skipping")
+        return None
+
+    agent_card = AgentCard(
+        protocol_version="1.0",
+        name=agent_data["name"],
+        path=path,
+        url=agent_data["url"],
+        description=agent_data["description"],
+        version=agent_data["version"],
+        # Per the A2A spec, AgentProvider requires both organization and url.
+        provider=AgentProvider(
+            organization="MuleSoft Anypoint Exchange",
+            url=ANYPOINT_PROVIDER_URL,
+        ),
+        license="Unknown",
+        skills=agent_data["skills"],
+        tags=agent_data["tags"],
+        supported_protocol=agent_data["supported_protocol"],
+        visibility="public",
+        registered_by=registered_by,
+        registered_at=datetime.now(UTC),
+    )
+
+    await agent_service.register_agent(agent_card)
+    logger.info(f"Synced Anypoint agent: {agent_data['name']} at {path}")
+    return agent_data["name"]
+
+
+async def _sync_anypoint_assets(
+    config: Any,
+    results: dict[str, Any],
+    user_context: dict[str, Any],
+) -> None:
+    """Sync assets from every configured Anypoint organization.
+
+    Per-asset failures are logged and skipped rather than aborting the batch,
+    so one malformed asset cannot block an otherwise good sync.
+
+    Args:
+        config: Federation config carrying the anypoint block
+        results: Mutable results dict to populate
+        user_context: Authenticated user context, for registrant attribution
+    """
+    from ..services.federation.anypoint_client import AnypointFederationClient
+
+    logger.info("Syncing assets from Anypoint Exchange...")
+
+    registered_by = user_context.get("username", "anypoint-federation")
+
+    client = AnypointFederationClient(
+        base_url=config.anypoint.base_url,
+        timeout_seconds=config.anypoint.sync_timeout_seconds,
+    )
+
+    for org in config.anypoint.organizations:
+        assets = client.fetch_assets(org)
+
+        for asset in assets:
+            asset_id = asset.get("assetId", "unknown")
+
+            # Only published assets are importable - the source decides what is
+            # publishable, analogous to AgentCore's APPROVED status filter.
+            if asset.get("status") != PUBLISHED_ASSET_STATUS:
+                logger.debug(
+                    f"Skipping Anypoint asset {asset_id} with status "
+                    f"{asset.get('status')!r} (not {PUBLISHED_ASSET_STATUS})"
+                )
+                continue
+
+            try:
+                if asset.get("type") == "mcp":
+                    server_data = client.transform_mcp_asset(asset, org)
+                    name = await _register_anypoint_server(server_data, registered_by)
+                    if name:
+                        results["anypoint"]["servers"].append(name)
+                else:
+                    agent_data = client.transform_a2a_asset(asset, org)
+                    name = await _register_anypoint_agent(agent_data, registered_by)
+                    if name:
+                        results["anypoint"]["agents"].append(name)
+
+            except Exception as e:
+                logger.error(f"Failed to sync Anypoint asset {asset_id}: {e}")
+
+    results["anypoint"]["count"] = len(results["anypoint"]["servers"]) + len(
+        results["anypoint"]["agents"]
+    )
+    logger.info(
+        f"Synced from Anypoint Exchange: "
+        f"{len(results['anypoint']['servers'])} servers, "
+        f"{len(results['anypoint']['agents'])} agents"
+    )
+
+
 @router.post("/federation/sync", tags=["federation"], summary="Trigger manual federation sync")
 async def sync_federation(
     request: Request,
@@ -1043,6 +1212,7 @@ async def sync_federation(
             "anthropic": {"servers": [], "count": 0},
             "asor": {"agents": [], "count": 0},
             "aws_registry": {"servers": [], "agents": [], "skills": [], "count": 0},
+            "anypoint": {"servers": [], "agents": [], "count": 0},
         }
 
         # Sync Anthropic servers if enabled and requested
@@ -1273,6 +1443,10 @@ async def sync_federation(
                 f"{len(results['aws_registry']['skills'])} skills"
             )
 
+        # Sync Anypoint Exchange assets if enabled and requested
+        if (source is None or source == "anypoint") and config.anypoint.enabled:
+            await _sync_anypoint_assets(config, results, user_context)
+
         # Reconcile: remove stale federated servers after sync
         reconciliation_result = None
         try:
@@ -1304,6 +1478,7 @@ async def sync_federation(
                 results["anthropic"]["count"]
                 + results["asor"]["count"]
                 + results["aws_registry"]["count"]
+                + results["anypoint"]["count"]
             ),
             "reconciliation": reconciliation_result,
         }

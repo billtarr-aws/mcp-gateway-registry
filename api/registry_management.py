@@ -7648,8 +7648,11 @@ Examples:
     )
     federation_sync_parser.add_argument(
         "--source",
-        choices=["anthropic", "asor", "aws_registry"],
-        help="Optional source filter (anthropic, asor, or aws_registry). Syncs all enabled sources if not specified.",
+        choices=["anthropic", "asor", "aws_registry", "anypoint"],
+        help=(
+            "Optional source filter (anthropic, asor, aws_registry, or anypoint). "
+            "Syncs all enabled sources if not specified."
+        ),
     )
     federation_sync_parser.add_argument(
         "--json", action="store_true", help="Output raw JSON instead of formatted text"

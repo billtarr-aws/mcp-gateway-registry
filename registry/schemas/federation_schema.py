@@ -66,6 +66,93 @@ class AwsRegistryFederationConfig(BaseModel):
     registries: list[AwsRegistryConfig] = Field(default_factory=list)
 
 
+class AnypointOrgConfig(BaseModel):
+    """Configuration for a single Anypoint organization (or business group) to sync from.
+
+    Credentials are referenced by environment-variable NAME, never stored inline,
+    matching the indirection AsorFederationConfig uses via auth_env_var. A config
+    export therefore cannot leak them.
+
+    Assets in Anypoint Exchange are permanently bound to a business group, so an
+    organization whose assets live in several groups needs one entry per group.
+    """
+
+    org_id: str = Field(
+        ..., min_length=1, description="Anypoint organizationId (or business group id)"
+    )
+    name: str | None = Field(default=None, description="Display label for this organization")
+    client_id_env_var: str | None = Field(
+        default=None,
+        description="Name of the env var holding the Anypoint connected-app client id",
+    )
+    client_secret_env_var: str | None = Field(
+        default=None,
+        description="Name of the env var holding the Anypoint connected-app client secret",
+    )
+    asset_types: list[str] = Field(
+        default_factory=lambda: ["mcp", "a2a"],
+        description=(
+            "Exchange asset types to import. Defaults to the protocol-typed assets: "
+            "'mcp' carries a full contract (tools, schemas, transport), 'a2a' declares "
+            "a protocol we can act on. The generic 'agent' type carries provenance only "
+            "and is excluded by default."
+        ),
+    )
+    base_url_override: str | None = Field(
+        default=None,
+        description=(
+            "Base URL to combine with an asset's transport path when Exchange supplies "
+            "a path but no host. Without this, imported assets are discovery-only."
+        ),
+    )
+
+    @field_validator("asset_types")
+    @classmethod
+    def _validate_asset_types(cls, v: list[str]) -> list[str]:
+        """Reject unknown asset types rather than silently importing nothing."""
+        allowed = {"mcp", "a2a", "agent"}
+        invalid = [t for t in v if t not in allowed]
+        if invalid:
+            raise ValueError(
+                f"Unsupported Anypoint asset types {invalid}; allowed: {sorted(allowed)}"
+            )
+        return v
+
+
+class AnypointFederationConfig(BaseModel):
+    """Anypoint Exchange (MuleSoft Agent Fabric) federation configuration.
+
+    Read-only pull federation from Anypoint Exchange, following the shape of
+    AwsRegistryFederationConfig: per-source credentials, scheduled sync, and
+    vendor-asset to native-record transformation.
+    """
+
+    enabled: bool = False
+    base_url: str = Field(
+        default="https://anypoint.mulesoft.com",
+        description="Anypoint control plane base URL (EU/gov control planes differ)",
+    )
+    sync_on_startup: bool = False
+    sync_interval_minutes: int = Field(default=60, ge=5, le=1440)
+    sync_timeout_seconds: int = Field(default=300, ge=1, le=3600)
+    organizations: list[AnypointOrgConfig] = Field(default_factory=list)
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, v: str) -> str:
+        """Require https: the token request carries a client secret.
+
+        Full SSRF validation happens in the client via the FEDERATION url-guard
+        profile; this is a fail-closed scheme check at the config boundary so a
+        plaintext control-plane URL is rejected before any credential is used.
+        """
+        if not v.startswith("https://"):
+            raise ValueError(
+                "Anypoint base_url must use https (the token request carries a secret)"
+            )
+        return v.rstrip("/")
+
+
 class AiCatalogSourceConfig(BaseModel):
     """A single ARD ai-catalog.json ingestion source (issue #1296, Phase 3).
 
@@ -137,6 +224,7 @@ class FederationConfig(BaseModel):
     asor: AsorFederationConfig = Field(default_factory=AsorFederationConfig)
     aws_registry: AwsRegistryFederationConfig = Field(default_factory=AwsRegistryFederationConfig)
     ai_catalog: AiCatalogFederationConfig = Field(default_factory=AiCatalogFederationConfig)
+    anypoint: AnypointFederationConfig = Field(default_factory=AnypointFederationConfig)
 
     @model_validator(mode="before")
     @classmethod
