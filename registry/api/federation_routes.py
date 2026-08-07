@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 # is publishable, and we honour that decision rather than importing drafts.
 PUBLISHED_ASSET_STATUS: str = "published"
 
+# An Anypoint API Manager instance whose status is not this is configured but not
+# necessarily listening, so it is skipped unless an operator opts in.
+ACTIVE_INSTANCE_STATUS: str = "active"
+
 # Provider URL recorded on imported Anypoint agents. The A2A spec requires both
 # organization and url when provider is present, and Exchange supplies no
 # per-asset provider URL, so this identifies the catalog rather than the agent.
@@ -91,9 +95,12 @@ def _validate_federation_endpoints(config: FederationConfig) -> None:
     or cloud-metadata IPs). Defense-in-depth: sync re-validates before egress.
 
     Note the attribute name differs per source (``endpoint`` vs ``base_url``), so
-    each entry names its own field rather than assuming one convention. Anypoint's
-    per-organization ``base_url_override`` is validated too: it is operator-supplied
-    and becomes an imported server's ``proxy_pass_url``.
+    each entry names its own field rather than assuming one convention.
+
+    Anypoint imports derive ``proxy_pass_url`` from API Manager rather than from
+    config, so there is no per-organization URL to validate here. Those
+    vendor-supplied endpoints are validated at registration time instead — see
+    ``_sync_anypoint_assets``.
 
     Args:
         config: The federation config being saved.
@@ -108,11 +115,6 @@ def _validate_federation_endpoints(config: FederationConfig) -> None:
         ("asor", getattr(config.asor, "endpoint", "") or ""),
         ("anypoint", getattr(config.anypoint, "base_url", "") or ""),
     ]
-
-    for org in getattr(config.anypoint, "organizations", []) or []:
-        override = getattr(org, "base_url_override", "") or ""
-        if override:
-            candidates.append((f"anypoint organization '{org.org_id}' base_url_override", override))
 
     for label, endpoint in candidates:
         if endpoint and not _is_safe_url(endpoint):
@@ -1080,6 +1082,75 @@ async def _register_anypoint_agent(
     return agent_data["name"]
 
 
+def _anypoint_endpoint_is_safe(record: dict[str, Any]) -> bool:
+    """Validate a vendor-supplied endpoint before it becomes a proxy target.
+
+    Anypoint imports derive their url from API Manager, i.e. from a third party,
+    not from our config. So it must pass the same SSRF checks as any other
+    registrant-controlled URL before we route to it. Fail closed: a url that
+    cannot be validated is dropped rather than registered.
+
+    A record with no url at all is fine — it is a discovery-only import.
+
+    Args:
+        record: Transformed server or agent data
+
+    Returns:
+        True when the record is safe to register
+    """
+    from ..services.skill_service import _is_safe_url
+
+    url = record.get("proxy_pass_url") or record.get("url") or ""
+    if not url:
+        return True
+
+    if _is_safe_url(url):
+        return True
+
+    logger.warning(
+        f"Refusing Anypoint import for asset "
+        f"{record.get('metadata', {}).get('anypoint_asset_id')!r}: endpoint failed "
+        f"SSRF validation"
+    )
+    return False
+
+
+def _anypoint_instance_is_importable(
+    instance: dict[str, Any] | None,
+    org: Any,
+    asset_id: str,
+) -> bool:
+    """Decide whether an API Manager instance should be imported.
+
+    An instance whose status is not ``active`` is configured but not necessarily
+    listening, so importing it would register a server that fails health checks.
+    Operators can opt in via ``import_inactive_instances``.
+
+    Args:
+        instance: API Manager instance detail, or None for a discovery-only import
+        org: Organization config
+        asset_id: Asset id, for logging
+
+    Returns:
+        True when the instance should be imported
+    """
+    if instance is None:
+        return True
+
+    if org.import_inactive_instances:
+        return True
+
+    status = instance.get("status")
+    if status == ACTIVE_INSTANCE_STATUS:
+        return True
+
+    logger.info(
+        f"Skipping Anypoint instance {instance.get('id')} of asset {asset_id} "
+        f"with status {status!r} (set import_inactive_instances to override)"
+    )
+    return False
+
+
 async def _sync_anypoint_assets(
     config: Any,
     results: dict[str, Any],
@@ -1087,8 +1158,14 @@ async def _sync_anypoint_assets(
 ) -> None:
     """Sync assets from every configured Anypoint organization.
 
-    Per-asset failures are logged and skipped rather than aborting the batch,
-    so one malformed asset cannot block an otherwise good sync.
+    Exchange holds the descriptor; API Manager holds the deployed instance and
+    its endpoint. One Exchange asset can have several API Manager instances, so
+    this imports one record PER INSTANCE, and one discovery-only record for an
+    asset with no instances.
+
+    Per-asset and per-instance failures are logged and skipped rather than
+    aborting the batch, so one malformed asset cannot block an otherwise good
+    sync.
 
     Args:
         config: Federation config carrying the anypoint block
@@ -1100,6 +1177,7 @@ async def _sync_anypoint_assets(
     logger.info("Syncing assets from Anypoint Exchange...")
 
     registered_by = user_context.get("username", "anypoint-federation")
+    skipped_unsafe = 0
 
     client = AnypointFederationClient(
         base_url=config.anypoint.base_url,
@@ -1108,6 +1186,7 @@ async def _sync_anypoint_assets(
 
     for org in config.anypoint.organizations:
         assets = client.fetch_assets(org)
+        instance_index = client.fetch_api_instances(org)
 
         for asset in assets:
             asset_id = asset.get("assetId", "unknown")
@@ -1121,28 +1200,43 @@ async def _sync_anypoint_assets(
                 )
                 continue
 
-            try:
-                if asset.get("type") == "mcp":
-                    server_data = client.transform_mcp_asset(asset, org)
-                    name = await _register_anypoint_server(server_data, registered_by)
-                    if name:
-                        results["anypoint"]["servers"].append(name)
-                else:
-                    agent_data = client.transform_a2a_asset(asset, org)
-                    name = await _register_anypoint_agent(agent_data, registered_by)
-                    if name:
-                        results["anypoint"]["agents"].append(name)
+            for instance in client.iter_asset_instances(asset, instance_index):
+                if not _anypoint_instance_is_importable(instance, org, asset_id):
+                    continue
 
-            except Exception as e:
-                logger.error(f"Failed to sync Anypoint asset {asset_id}: {e}")
+                try:
+                    if asset.get("type") == "mcp":
+                        record = client.transform_mcp_asset(asset, org, instance)
+                        if not _anypoint_endpoint_is_safe(record):
+                            skipped_unsafe += 1
+                            continue
+                        name = await _register_anypoint_server(record, registered_by)
+                        if name:
+                            results["anypoint"]["servers"].append(name)
+                    else:
+                        record = client.transform_a2a_asset(asset, org, instance)
+                        if not _anypoint_endpoint_is_safe(record):
+                            skipped_unsafe += 1
+                            continue
+                        name = await _register_anypoint_agent(record, registered_by)
+                        if name:
+                            results["anypoint"]["agents"].append(name)
+
+                except Exception as e:
+                    logger.error(
+                        f"Failed to sync Anypoint asset {asset_id} "
+                        f"instance {instance.get('id') if instance else None}: {e}"
+                    )
 
     results["anypoint"]["count"] = len(results["anypoint"]["servers"]) + len(
         results["anypoint"]["agents"]
     )
+    results["anypoint"]["skipped_unsafe_endpoint"] = skipped_unsafe
     logger.info(
         f"Synced from Anypoint Exchange: "
         f"{len(results['anypoint']['servers'])} servers, "
         f"{len(results['anypoint']['agents'])} agents"
+        + (f", {skipped_unsafe} skipped for unsafe endpoints" if skipped_unsafe else "")
     )
 
 

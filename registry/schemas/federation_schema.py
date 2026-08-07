@@ -89,6 +89,20 @@ class AnypointOrgConfig(BaseModel):
         default=None,
         description="Name of the env var holding the Anypoint connected-app client secret",
     )
+    environment_id: str | None = Field(
+        default=None,
+        description=(
+            "Anypoint environment id to resolve endpoints from via API Manager. "
+            "REQUIRED for connectable imports: Exchange assets are environment-agnostic, "
+            "but API instances (and their endpoints) are per-environment. Without this, "
+            "assets import as discovery-only rather than silently mixing sandbox and "
+            "production endpoints."
+        ),
+    )
+    environment_name: str | None = Field(
+        default=None,
+        description="Display label for the environment (e.g. 'Production'); not used for lookup",
+    )
     asset_types: list[str] = Field(
         default_factory=lambda: ["mcp", "a2a"],
         description=(
@@ -98,11 +112,12 @@ class AnypointOrgConfig(BaseModel):
             "and is excluded by default."
         ),
     )
-    base_url_override: str | None = Field(
-        default=None,
+    import_inactive_instances: bool = Field(
+        default=False,
         description=(
-            "Base URL to combine with an asset's transport path when Exchange supplies "
-            "a path but no host. Without this, imported assets are discovery-only."
+            "Import API instances whose API Manager status is not 'active'. Off by "
+            "default: a configured endpoint is not a listening one, so an inactive "
+            "instance would register a server that fails health checks."
         ),
     )
 

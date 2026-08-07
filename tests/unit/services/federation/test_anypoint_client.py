@@ -23,13 +23,42 @@ from registry.schemas.federation_schema import (
 from registry.services.federation.anypoint_client import (
     AnypointFederationClient,
     _extract_attribute_url,
+    _extract_instance_url,
     _extract_transport,
+    _instance_path_suffix,
+    _instance_provenance,
     _resolve_proxy_url,
     _safe_parse_json,
     _sanitize_path_segment,
 )
 
 ORG_ID = "2ba26956-d5d9-4a43-8839-37c88b542c7d"
+ENV_ID = "b6202d2b-1753-4f0f-9172-e8556a3c79d2"
+
+# Captured live from API Manager instance 20943747 (Production environment).
+# status is forced to "active" here; the live instances report "inactive", which
+# is covered separately by the import-gate tests.
+APIM_INSTANCE = {
+    "id": 20943747,
+    "groupId": ORG_ID,
+    "assetId": "omni-gateway-orders-mcp-spec",
+    "assetVersion": "1.0.1",
+    "productVersion": "v1.0",
+    "environmentId": ENV_ID,
+    "instanceLabel": "Orders MCP Server",
+    "autodiscoveryInstanceName": "v1.0:20943747",
+    "technology": "flexGateway",
+    "stage": "release",
+    "status": "active",
+    "endpoint": {
+        "id": 5377837,
+        "type": "mcp",
+        "uri": "https://orders-mcp-v4-kau0jd.wfsahu.usa-e1.cloudhub.io",
+        "proxyUri": "http://0.0.0.0:8081/orders-mcp",
+        "apiGatewayVersion": "1.13.1",
+        "deploymentType": "HY",
+    },
+}
 
 MCP_METADATA = {
     "tools": [
@@ -214,34 +243,123 @@ class TestExtractAttributeUrl:
         assert _extract_attribute_url(asset) is None
 
 
-class TestResolveProxyUrl:
-    """Endpoint resolution: attribute url, then override + path, else none."""
+class TestExtractInstanceUrl:
+    """endpoint.uri is the backend; proxyUri is the gateway's own listener."""
 
-    def test_attribute_url_wins_over_override(self):
-        """The asset's own endpoint is more authoritative than an org default."""
-        asset = {"attributes": [{"key": "url", "value": "https://real.example.com/mcp"}]}
+    def test_reads_endpoint_uri(self):
+        """Captured live from API Manager instance 20943747."""
         assert (
-            _resolve_proxy_url(asset, "/mcp", "https://override.example.com")
-            == "https://real.example.com/mcp"
+            _extract_instance_url(APIM_INSTANCE)
+            == "https://orders-mcp-v4-kau0jd.wfsahu.usa-e1.cloudhub.io"
         )
 
-    def test_returns_none_without_url_or_override(self):
-        """No attribute url and no override means discovery-only."""
+    def test_never_returns_proxy_uri(self):
+        """proxyUri is http://0.0.0.0:8081/... - a wildcard bind, not routable."""
+        instance = {"endpoint": {"proxyUri": "http://0.0.0.0:8081/orders-mcp"}}
+        assert _extract_instance_url(instance) is None
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [None, "not-a-dict", {}, {"uri": None}, {"uri": 42}, {"uri": "/relative"}],
+        ids=["none", "string", "empty", "null-uri", "non-string", "relative"],
+    )
+    def test_malformed_endpoint_returns_none(self, endpoint):
+        assert _extract_instance_url({"endpoint": endpoint}) is None
+
+
+class TestResolveProxyUrl:
+    """Endpoint resolution: API Manager instance, then asset attribute, else none."""
+
+    def test_instance_url_wins_over_attribute(self):
+        """The instance endpoint is per-deployment; the attribute is per-asset."""
+        asset = {"attributes": [{"key": "url", "value": "https://asset-level.example.com/mcp"}]}
+        assert (
+            _resolve_proxy_url(asset, "/mcp", APIM_INSTANCE)
+            == "https://orders-mcp-v4-kau0jd.wfsahu.usa-e1.cloudhub.io"
+        )
+
+    def test_falls_back_to_attribute_when_no_instance(self):
+        asset = {"attributes": [{"key": "url", "value": "https://mapstools.googleapis.com/mcp"}]}
+        assert _resolve_proxy_url(asset, "/mcp", None) == "https://mapstools.googleapis.com/mcp"
+
+    def test_falls_back_to_attribute_when_instance_has_no_uri(self):
+        """An instance without a usable uri must not mask the asset-level url."""
+        asset = {"attributes": [{"key": "url", "value": "https://mapstools.googleapis.com/mcp"}]}
+        instance = {"id": 1, "endpoint": {"proxyUri": "http://0.0.0.0:8081/x"}}
+        assert _resolve_proxy_url(asset, "/mcp", instance) == "https://mapstools.googleapis.com/mcp"
+
+    def test_returns_none_with_neither(self):
+        """No instance and no attribute url means discovery-only."""
         assert _resolve_proxy_url({}, "/mcp", None) is None
 
-    def test_falls_back_to_override_and_path(self):
-        assert (
-            _resolve_proxy_url({}, "/mcp", "https://gw.example.com") == "https://gw.example.com/mcp"
-        )
+    def test_never_appends_transport_path(self):
+        """Both sources give complete urls; appending the path would corrupt them."""
+        result = _resolve_proxy_url({}, "/mcp", APIM_INSTANCE)
+        assert result == "https://orders-mcp-v4-kau0jd.wfsahu.usa-e1.cloudhub.io"
+        assert not result.endswith("/mcp/mcp")
 
-    def test_tolerates_duplicate_slashes(self):
-        assert (
-            _resolve_proxy_url({}, "/mcp", "https://gw.example.com/")
-            == "https://gw.example.com/mcp"
-        )
 
-    def test_override_alone_when_no_path(self):
-        assert _resolve_proxy_url({}, None, "https://gw.example.com") == "https://gw.example.com"
+class TestInstancePathSuffix:
+    """Several instances of one asset must not collide on a path."""
+
+    def test_prefers_label(self):
+        assert _instance_path_suffix(APIM_INSTANCE) == "orders-mcp-server"
+
+    def test_falls_back_to_id(self):
+        assert _instance_path_suffix({"id": 20943747}) == "20943747"
+
+    @pytest.mark.parametrize(
+        "label", [None, "", "   ", 42], ids=["none", "empty", "blank", "non-string"]
+    )
+    def test_unusable_label_falls_back_to_id(self, label):
+        assert _instance_path_suffix({"id": 99, "instanceLabel": label}) == "99"
+
+    def test_three_instances_of_one_asset_get_distinct_suffixes(self):
+        """The live case: one asset, three instances, three labels."""
+        labels = ["Orders MCP Server", "Salesforce SObject Reads", "Salesforce SObject All"]
+        suffixes = [
+            _instance_path_suffix({"id": i, "instanceLabel": s}) for i, s in enumerate(labels)
+        ]
+        assert len(set(suffixes)) == 3
+
+
+class TestInstanceProvenance:
+    """An operator must be able to find the source instance again."""
+
+    def test_records_instance_identity(self):
+        p = _instance_provenance(APIM_INSTANCE)
+        assert p["anypoint_api_instance_id"] == 20943747
+        assert p["anypoint_instance_label"] == "Orders MCP Server"
+        assert p["anypoint_environment_id"] == ENV_ID
+        assert p["anypoint_instance_status"] == "active"
+        assert p["anypoint_endpoint_type"] == "mcp"
+
+    def test_records_proxy_uri_without_using_it(self):
+        """proxyUri is kept for diagnosis but must never be the proxy target."""
+        p = _instance_provenance(APIM_INSTANCE)
+        assert p["anypoint_proxy_uri"] == "http://0.0.0.0:8081/orders-mcp"
+
+    def test_none_instance_yields_null_fields(self):
+        p = _instance_provenance(None)
+        assert p["anypoint_api_instance_id"] is None
+        assert p["anypoint_environment_id"] is None
+
+
+class TestIterAssetInstances:
+    """The one-to-many join, and the must-not-drop-assets rule."""
+
+    def test_returns_all_instances_for_an_asset(self, client):
+        index = {(MCP_ASSET["assetId"], MCP_ASSET["version"]): [{"id": 1}, {"id": 2}, {"id": 3}]}
+        assert len(client.iter_asset_instances(MCP_ASSET, index)) == 3
+
+    def test_asset_with_no_instances_yields_one_none(self, client):
+        """It must still import as discovery-only, not be dropped."""
+        assert client.iter_asset_instances(MCP_ASSET, {}) == [None]
+
+    def test_join_is_on_asset_id_and_version(self, client):
+        """A version mismatch must not join."""
+        index = {(MCP_ASSET["assetId"], "9.9.9"): [{"id": 1}]}
+        assert client.iter_asset_instances(MCP_ASSET, index) == [None]
 
 
 class TestAccessToken:
@@ -435,14 +553,46 @@ class TestTransformMcpAsset:
         assert result["proxy_pass_url"] == "https://mapstools.googleapis.com/mcp"
         assert result["metadata"]["discovery_only"] is False
 
-    def test_connectable_with_override(self, client):
+    def test_connectable_from_api_manager_instance(self, client):
+        """The live case: Exchange has no url, API Manager supplies it."""
+        with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
+            result = client.transform_mcp_asset(MCP_ASSET, _org(), APIM_INSTANCE)
+
+        assert result["proxy_pass_url"] == "https://orders-mcp-v4-kau0jd.wfsahu.usa-e1.cloudhub.io"
+        assert result["metadata"]["discovery_only"] is False
+
+    def test_instance_qualifies_the_path(self, client):
+        """Three instances of one asset must land on three distinct paths."""
+        with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
+            paths = {
+                client.transform_mcp_asset(
+                    MCP_ASSET, _org(), {**APIM_INSTANCE, "id": i, "instanceLabel": label}
+                )["path"]
+                for i, label in enumerate(
+                    ["Orders MCP Server", "Salesforce SObject Reads", "Salesforce SObject All"]
+                )
+            }
+
+        assert len(paths) == 3
+        assert "/anypoint-omni-gateway-orders-mcp-server-orders-mcp-server" in paths
+
+    def test_instance_label_becomes_the_name(self, client):
+        """ "Salesforce SObject Reads" is more useful than the generic asset name."""
         with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
             result = client.transform_mcp_asset(
-                MCP_ASSET, _org(base_url_override="https://gw.example.com")
+                MCP_ASSET, _org(), {**APIM_INSTANCE, "instanceLabel": "Salesforce SObject Reads"}
             )
 
-        assert result["proxy_pass_url"] == "https://gw.example.com/mcp"
-        assert result["metadata"]["discovery_only"] is False
+        assert result["server_name"] == "Salesforce SObject Reads"
+
+    def test_records_instance_provenance(self, client):
+        with patch.object(client, "fetch_asset_metadata", return_value=MCP_METADATA):
+            result = client.transform_mcp_asset(MCP_ASSET, _org(), APIM_INSTANCE)
+
+        md = result["metadata"]
+        assert md["anypoint_api_instance_id"] == 20943747
+        assert md["anypoint_environment_id"] == ENV_ID
+        assert md["anypoint_proxy_uri"] == "http://0.0.0.0:8081/orders-mcp"
 
     def test_lands_disabled(self, client):
         """Imports must not be live until an operator enables them."""

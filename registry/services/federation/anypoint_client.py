@@ -13,20 +13,30 @@ organization rather than inferred from documentation:
    ``agent-metadata`` carries provenance only (botDefinitionId, platform,
    status). This is why ``asset_types`` defaults to the protocol-typed assets.
 
-2. The endpoint lives in ``attributes``, not in the transport descriptor.
-   ``mcp-metadata.transport`` gives a path only
-   (``{"kind": "streamableHttp", "path": "/mcp"}``), but the asset record's
-   ``attributes`` list can carry a ``url`` key holding a COMPLETE endpoint -
-   e.g. ``https://mapstools.googleapis.com/mcp``. Whether it does depends on
-   whether the scanner that imported the asset knew the deployed endpoint: in
-   the sample org, 2 of 3 ``mcp`` assets had one and no ``a2a`` asset did. So
-   connectability is per-asset, not a property of Exchange. Assets without a
-   ``url`` attribute are discovery-only unless an operator supplies
-   ``base_url_override``.
+2. The endpoint comes from one of two places, and NEITHER is the transport
+   descriptor. ``mcp-metadata.transport`` gives a path only
+   (``{"kind": "streamableHttp", "path": "/mcp"}``). Resolution order:
+
+   a. The asset record's ``attributes`` list may carry a ``url`` key holding a
+      COMPLETE endpoint - e.g. ``https://mapstools.googleapis.com/mcp``. Present
+      when the scanner that imported the asset knew the deployed endpoint (2 of 3
+      ``mcp`` assets in the sample org; no ``a2a`` asset).
+   b. **API Manager**, a sibling Anypoint service, holds the deployed API
+      instance and its ``endpoint.uri``. This is where the endpoint lives for
+      everything else, and it required no guessing: an API instance carries the
+      Exchange coordinates (``groupId``/``assetId``/``assetVersion``) verbatim,
+      so the join is an explicit foreign key.
+
+3. Exchange asset to API instance is **one-to-many**, and instances are scoped
+   per ENVIRONMENT while Exchange assets are not. In the sample org, the single
+   asset ``omni-gateway-orders-mcp-spec`` v1.0.1 has THREE API Manager instances
+   with three different endpoints and policy sets. So one Exchange asset can
+   yield several registry records, and an import that ignores environment would
+   silently mix sandbox and production endpoints.
 
 API documentation: https://docs.mulesoft.com/exchange/
-The asset listing endpoint (Platform API v2) is undocumented but stable in
-practice; it is the only outbound catalog read Exchange exposes.
+The Exchange asset listing (Platform API v2) is undocumented but stable in
+practice. The API Manager endpoints used here are documented.
 """
 
 import json
@@ -34,7 +44,6 @@ import logging
 import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urljoin
 
 from ...common.log_redaction import redact_url
 from ...schemas.federation_schema import AnypointOrgConfig
@@ -53,6 +62,17 @@ ANYPOINT_ATTRIBUTION: str = "MuleSoft Anypoint Exchange"
 # Platform API paths, relative to the configured control-plane base_url.
 TOKEN_PATH: str = "/accounts/api/v2/oauth2/token"
 ASSETS_PATH: str = "/exchange/api/v2/assets"
+
+# API Manager. The list response groups by Exchange asset and nests apis[], but
+# omits endpoint detail; the per-instance call is what carries endpoint.uri.
+APIMANAGER_APIS_PATH: str = "/apimanager/api/v1/organizations/{org_id}/environments/{env_id}/apis"
+APIMANAGER_API_PATH: str = (
+    "/apimanager/api/v1/organizations/{org_id}/environments/{env_id}/apis/{api_id}"
+)
+
+# An API Manager instance whose status is not this is configured but not
+# necessarily listening. Importing one produces a server that fails health checks.
+ACTIVE_INSTANCE_STATUS: str = "active"
 
 # Token lifetime is 3600s in practice; refresh early so a long sync cannot
 # straddle an expiry. Mirrors the 60s buffer in FederationAuthManager.
@@ -103,7 +123,7 @@ def _sanitize_path_segment(value: str) -> str:
     """Reduce an asset id to a URL-safe path segment.
 
     Args:
-        value: Raw Exchange assetId
+        value: Raw Exchange assetId, or an API Manager instance label
 
     Returns:
         Lowercased segment containing only alphanumerics and hyphens
@@ -112,7 +132,10 @@ def _sanitize_path_segment(value: str) -> str:
     for char in value.lower():
         if char.isalnum():
             allowed.append(char)
-        elif char in {"-", "_", "."}:
+        # Whitespace becomes a separator, not nothing: instance labels are
+        # human-written ("Orders MCP Server"), and dropping spaces outright
+        # would run words together into "ordersmcpserver".
+        elif char in {"-", "_", ".", " ", "\t"}:
             allowed.append("-")
 
     segment = "".join(allowed).strip("-")
@@ -186,43 +209,128 @@ def _extract_attribute_url(asset: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_instance_url(instance: dict[str, Any]) -> str | None:
+    """Read the backend endpoint from an API Manager instance detail response.
+
+    ``endpoint.uri`` is the real upstream (e.g.
+    ``https://orders-mcp-v4-kau0jd.wfsahu.usa-e1.cloudhub.io``).
+
+    ``endpoint.proxyUri`` is deliberately NOT used: it is the Flex Gateway's own
+    listener address, observed as ``http://0.0.0.0:8081/orders-mcp``. A wildcard
+    bind address is not routable from here, and treating it as a proxy target
+    would register an unreachable server.
+
+    Args:
+        instance: API Manager per-instance detail response
+
+    Returns:
+        Absolute http(s) url, or None when absent or unusable
+    """
+    endpoint = instance.get("endpoint")
+    if not isinstance(endpoint, dict):
+        return None
+
+    uri = endpoint.get("uri")
+    if not isinstance(uri, str):
+        return None
+
+    uri = uri.strip()
+    if uri.startswith(("http://", "https://")):
+        return uri
+
+    return None
+
+
+def _instance_path_suffix(instance: dict[str, Any]) -> str:
+    """Build a stable, unique path suffix for one API Manager instance.
+
+    Prefers the human-readable ``instanceLabel`` because it survives a
+    redeployment; falls back to the numeric ``id``, which is unique but opaque.
+
+    Args:
+        instance: API Manager instance detail
+
+    Returns:
+        Sanitized path segment, never empty
+    """
+    label = instance.get("instanceLabel")
+    if isinstance(label, str) and label.strip():
+        suffix = _sanitize_path_segment(label)
+        if suffix:
+            return suffix
+
+    return _sanitize_path_segment(str(instance.get("id", "instance")))
+
+
+def _instance_provenance(instance: dict[str, Any] | None) -> dict[str, Any]:
+    """Record which API Manager instance an imported record came from.
+
+    Without this an operator cannot tell three records sharing one Exchange
+    asset apart, nor find the instance again in API Manager.
+
+    Args:
+        instance: API Manager instance detail, or None
+
+    Returns:
+        Metadata fragment; empty when there is no instance
+    """
+    if not instance:
+        return {"anypoint_api_instance_id": None, "anypoint_environment_id": None}
+
+    endpoint = instance.get("endpoint")
+    endpoint = endpoint if isinstance(endpoint, dict) else {}
+
+    return {
+        "anypoint_api_instance_id": instance.get("id"),
+        "anypoint_instance_label": instance.get("instanceLabel"),
+        "anypoint_environment_id": instance.get("environmentId"),
+        "anypoint_instance_status": instance.get("status"),
+        "anypoint_instance_stage": instance.get("stage"),
+        "anypoint_technology": instance.get("technology"),
+        "anypoint_endpoint_type": endpoint.get("type"),
+        # The Flex Gateway listener, recorded but never used as a proxy target
+        # because it is a wildcard bind address (0.0.0.0) in practice.
+        "anypoint_proxy_uri": endpoint.get("proxyUri"),
+    }
+
+
 def _resolve_proxy_url(
     asset: dict[str, Any],
     path: str | None,
-    base_url_override: str | None,
+    instance: dict[str, Any] | None,
 ) -> str | None:
     """Determine the endpoint for an imported asset.
 
-    Resolution order, most to least authoritative:
+    Resolution order, most to least specific:
 
-    1. The asset's own ``url`` attribute, when present. This is a complete
-       url recorded by whichever scanner imported the asset into Exchange.
-    2. An operator-supplied ``base_url_override`` joined with the transport
-       path from ``mcp-metadata``.
-    3. The override alone, when the metadata carries no path.
+    1. The API Manager instance's ``endpoint.uri``, when an instance was
+       resolved. This is the deployed endpoint for THIS instance, and it is the
+       only source that distinguishes one instance of a multiply-deployed asset
+       from another.
+    2. The Exchange asset's own ``url`` attribute, when present. Asset-level, so
+       it cannot distinguish between instances - correct only when there is one.
+    3. None. The asset is discovery-only, which must not be papered over with a
+       guessed or wildcard host.
 
-    Returns None when none of those apply - the asset is then discovery-only.
-    That outcome must not be papered over with a guessed host.
+    Note ``path`` (from ``mcp-metadata.transport``) is intentionally NOT joined
+    onto either url. Both sources supply a complete endpoint, and the observed
+    instance uris already include their own path where one applies. Appending
+    would corrupt them.
 
     Args:
         asset: Raw Exchange asset dict
-        path: Transport path from mcp-metadata, if any
-        base_url_override: Operator-supplied base URL for this organization
+        path: Transport path from mcp-metadata; retained for provenance only
+        instance: API Manager instance detail, when one was resolved
 
     Returns:
         Absolute URL, or None when no host is available
     """
-    attribute_url = _extract_attribute_url(asset)
-    if attribute_url:
-        return attribute_url
+    if instance:
+        instance_url = _extract_instance_url(instance)
+        if instance_url:
+            return instance_url
 
-    if not base_url_override:
-        return None
-
-    if not path:
-        return base_url_override
-
-    return urljoin(base_url_override.rstrip("/") + "/", path.lstrip("/"))
+    return _extract_attribute_url(asset)
 
 
 class AnypointFederationClient(BaseFederationClient):
@@ -404,6 +512,121 @@ class AnypointFederationClient(BaseFederationClient):
         )
         return collected
 
+    def fetch_api_instances(
+        self,
+        org: AnypointOrgConfig,
+    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
+        """Fetch API Manager instances for one environment, indexed by asset.
+
+        This is the second half of the two-service join. Exchange holds the
+        descriptor; API Manager holds the deployed instance and its endpoint.
+        They join on (assetId, assetVersion), which an API instance carries
+        verbatim from Exchange.
+
+        The list response groups by asset and nests ``apis[]``, but omits
+        endpoint detail, so each instance needs a follow-up detail call.
+
+        Returns an empty index when no ``environment_id`` is configured -
+        imports then fall back to asset-level urls and are usually
+        discovery-only. That is deliberate: guessing an environment would risk
+        importing a sandbox endpoint as if it were production.
+
+        Args:
+            org: Organization config, including environment_id
+
+        Returns:
+            Mapping of (assetId, assetVersion) -> list of instance detail dicts
+        """
+        if not org.environment_id:
+            logger.info(
+                f"Anypoint org {org.org_id} has no environment_id; skipping API Manager "
+                f"endpoint resolution (imports will be discovery-only unless the asset "
+                f"carries its own url attribute)"
+            )
+            return {}
+
+        token = self._get_access_token(org)
+        if not token:
+            return {}
+
+        listing = self._make_request(
+            url=self.endpoint
+            + APIMANAGER_APIS_PATH.format(org_id=org.org_id, env_id=org.environment_id),
+            headers={"Authorization": f"Bearer {token}"},
+            params={"limit": ASSET_PAGE_SIZE},
+        )
+
+        if not isinstance(listing, dict):
+            logger.warning(
+                f"Unexpected API Manager listing shape for org {org.org_id} "
+                f"environment {org.environment_id}"
+            )
+            return {}
+
+        index: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        grouped = listing.get("assets")
+        if not isinstance(grouped, list):
+            return {}
+
+        for group in grouped:
+            if not isinstance(group, dict):
+                continue
+
+            for api in group.get("apis") or []:
+                if not isinstance(api, dict):
+                    continue
+
+                api_id = api.get("id")
+                if api_id is None:
+                    continue
+
+                detail = self._fetch_api_instance(org, token, api_id)
+                if not detail:
+                    continue
+
+                key = (
+                    str(detail.get("assetId", group.get("assetId", ""))),
+                    str(detail.get("assetVersion", "")),
+                )
+                index.setdefault(key, []).append(detail)
+
+        total = sum(len(v) for v in index.values())
+        logger.info(
+            f"Resolved {total} API Manager instance(s) across {len(index)} asset "
+            f"version(s) in environment {org.environment_id}"
+        )
+        return index
+
+    def _fetch_api_instance(
+        self,
+        org: AnypointOrgConfig,
+        token: str,
+        api_id: Any,
+    ) -> dict[str, Any] | None:
+        """Fetch one API Manager instance's detail, which carries endpoint.uri.
+
+        Args:
+            org: Organization config
+            token: Platform access token
+            api_id: API Manager numeric instance id
+
+        Returns:
+            Instance detail dict, or None on failure
+        """
+        detail = self._make_request(
+            url=self.endpoint
+            + APIMANAGER_API_PATH.format(
+                org_id=org.org_id, env_id=org.environment_id, api_id=api_id
+            ),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        if isinstance(detail, dict):
+            return detail
+
+        logger.warning(f"Could not fetch API Manager instance {api_id}")
+        return None
+
     def fetch_asset_metadata(
         self,
         asset: dict[str, Any],
@@ -459,12 +682,19 @@ class AnypointFederationClient(BaseFederationClient):
         self,
         asset: dict[str, Any],
         org: AnypointOrgConfig,
+        instance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Transform an Exchange ``mcp`` asset into server registration data.
+
+        One asset can have several API Manager instances, so this is called once
+        per instance and the resulting path is instance-qualified. Called with
+        ``instance=None`` for an asset that has no deployed instance, which
+        yields a discovery-only record.
 
         Args:
             asset: Raw Exchange asset dict
             org: Organization config
+            instance: API Manager instance detail, when one was resolved
 
         Returns:
             Server data dict suitable for registration
@@ -476,12 +706,23 @@ class AnypointFederationClient(BaseFederationClient):
 
         metadata = self.fetch_asset_metadata(asset, MCP_METADATA_CLASSIFIER, org)
         transport_type, path = _extract_transport(metadata)
-        proxy_url = _resolve_proxy_url(asset, path, org.base_url_override)
+        proxy_url = _resolve_proxy_url(asset, path, instance)
 
         tools = metadata.get("tools")
         tool_list = tools if isinstance(tools, list) else []
 
+        # Several instances of one asset must not collide on a single path, so the
+        # instance label (or id) qualifies it. Without an instance the asset id
+        # alone is unambiguous.
         path_segment = _sanitize_path_segment(asset_id)
+        if instance:
+            path_segment = f"{path_segment}-{_instance_path_suffix(instance)}"
+            # An instance label is more specific than the asset name when one
+            # asset is deployed several times ("Salesforce SObject Reads" vs
+            # the generic "Omni Gateway Orders MCP Server").
+            label = instance.get("instanceLabel")
+            if isinstance(label, str) and label.strip():
+                name = label.strip()
 
         return {
             "source": ANYPOINT_SOURCE,
@@ -514,6 +755,7 @@ class AnypointFederationClient(BaseFederationClient):
                 # Recorded explicitly so an operator can tell a discovery-only
                 # import from a connectable one without inspecting proxy_pass_url.
                 "discovery_only": proxy_url is None,
+                **_instance_provenance(instance),
             },
             "cached_at": datetime.now(UTC).isoformat(),
             "is_read_only": True,
@@ -527,15 +769,19 @@ class AnypointFederationClient(BaseFederationClient):
         self,
         asset: dict[str, Any],
         org: AnypointOrgConfig,
+        instance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Transform an Exchange ``a2a`` or ``agent`` asset into agent data.
 
-        These assets carry provenance only - no url, securitySchemes, or
-        skills - so the resulting record is deliberately sparse.
+        The Exchange asset itself carries provenance only - no url,
+        securitySchemes, or skills. An API Manager instance supplies the
+        endpoint when one exists, so the record is sparse but can still be
+        connectable.
 
         Args:
             asset: Raw Exchange asset dict
             org: Organization config
+            instance: API Manager instance detail, when one was resolved
 
         Returns:
             Agent data dict suitable for registration
@@ -548,12 +794,14 @@ class AnypointFederationClient(BaseFederationClient):
         metadata = self.fetch_asset_metadata(asset, AGENT_METADATA_CLASSIFIER, org)
         provenance = metadata.get("provenance")
 
-        path_segment = _sanitize_path_segment(asset_id)
+        agent_url = _resolve_proxy_url(asset, None, instance) or ""
 
-        # Agent-shaped assets carry no transport metadata, but they can still
-        # carry a `url` attribute if the importing scanner knew the endpoint.
-        # None observed in the sample org, so this is usually empty.
-        agent_url = _extract_attribute_url(asset) or org.base_url_override or ""
+        path_segment = _sanitize_path_segment(asset_id)
+        if instance:
+            path_segment = f"{path_segment}-{_instance_path_suffix(instance)}"
+            label = instance.get("instanceLabel")
+            if isinstance(label, str) and label.strip():
+                name = label.strip()
 
         return {
             "source": ANYPOINT_SOURCE,
@@ -582,9 +830,40 @@ class AnypointFederationClient(BaseFederationClient):
                 "asset_type": asset.get("type"),
                 "provenance": provenance,
                 "discovery_only": not agent_url,
+                **_instance_provenance(instance),
             },
             "cached_at": datetime.now(UTC).isoformat(),
         }
+
+    def iter_asset_instances(
+        self,
+        asset: dict[str, Any],
+        instance_index: dict[tuple[str, str], list[dict[str, Any]]],
+    ) -> list[dict[str, Any] | None]:
+        """Return the API Manager instances for one asset, or [None] if it has none.
+
+        This is what turns the one-to-many relationship into a list the caller can
+        loop over uniformly: an asset with three instances yields three entries, and
+        an asset with none yields a single ``None`` so it still imports as a
+        discovery-only record rather than being dropped.
+
+        The join is on (assetId, assetVersion), which an API instance carries
+        verbatim from Exchange.
+
+        Args:
+            asset: Raw Exchange asset dict
+            instance_index: Output of fetch_api_instances()
+
+        Returns:
+            List of instance dicts, or ``[None]`` when the asset has no instances
+        """
+        key = (str(asset.get("assetId", "")), str(asset.get("version", "")))
+        instances = instance_index.get(key)
+
+        if not instances:
+            return [None]
+
+        return list(instances)
 
     def fetch_server(self, server_name: str, **kwargs) -> dict[str, Any] | None:
         """Not supported: Exchange is enumerated, not queried by server name.
