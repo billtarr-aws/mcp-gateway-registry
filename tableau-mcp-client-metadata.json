@@ -1,5 +1,5 @@
 {
-  "client_id": "https://billtarr-aws.github.io/mcp-gateway-registry/tableau-mcp-client-metadata.json",
+  "client_id": "https://raw.githubusercontent.com/billtarr-aws/mcp-gateway-registry/gh-pages/tableau-mcp-client-metadata.json",
   "client_name": "Tableau MCP Inspector (AWS)",
   "client_uri": "https://github.com/billtarr-aws",
   "redirect_uris": [
