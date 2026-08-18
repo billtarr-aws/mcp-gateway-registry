@@ -1,0 +1,19 @@
+{
+  "client_id": "https://billtarr-aws.github.io/mcp-gateway-registry/tableau-mcp-client-metadata.json",
+  "client_name": "Tableau MCP Inspector (AWS)",
+  "client_uri": "https://github.com/billtarr-aws",
+  "redirect_uris": [
+    "http://localhost:6274/oauth/callback",
+    "http://127.0.0.1:6274/oauth/callback",
+    "http://localhost:6274/oauth/callback/debug",
+    "http://127.0.0.1:6274/oauth/callback/debug"
+  ],
+  "grant_types": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "response_types": [
+    "code"
+  ],
+  "token_endpoint_auth_method": "none"
+}
